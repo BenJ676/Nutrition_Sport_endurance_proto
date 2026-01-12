@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'dart:convert';
+import 'package:file_picker/file_picker.dart';
 import 'weather_gpx_tools.dart';
+import 'weather_auto_open_meteo.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -268,12 +271,12 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
   }
 
   Widget _sectionTitle(String s) => Padding(
-    padding: const EdgeInsets.only(top: 18, bottom: 8),
-    child: Text(
-      s,
-      style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-    ),
-  );
+        padding: const EdgeInsets.only(top: 18, bottom: 8),
+        child: Text(
+          s,
+          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+        ),
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -316,7 +319,6 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
             ),
           ),
           const SizedBox(height: 12),
-
           DropdownButtonFormField<String>(
             initialValue: _type,
             items: _typeLabels.entries
@@ -328,7 +330,6 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
             decoration: const InputDecoration(labelText: 'Type de produit'),
           ),
           const SizedBox(height: 12),
-
           DropdownButtonFormField<String>(
             initialValue: _basis,
             items: _basisLabels.entries
@@ -340,7 +341,6 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
             decoration: const InputDecoration(labelText: 'Base des valeurs'),
           ),
           const SizedBox(height: 12),
-
           DropdownButtonFormField<String>(
             initialValue: _intakeContext,
             items: _contextLabels.entries
@@ -352,7 +352,6 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
             decoration: const InputDecoration(labelText: 'Moment de la prise'),
           ),
           const SizedBox(height: 12),
-
           _sectionTitle('Quantité'),
           TextField(
             controller: _weightGCtrl,
@@ -361,7 +360,6 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
               labelText: 'Poids de la prise (g) (ex: 65)',
             ),
           ),
-
           if (_isHydration) ...[
             _sectionTitle('Hydratation'),
             TextField(
@@ -380,7 +378,6 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
               ),
             ),
           ],
-
           _sectionTitle('Valeurs nutritionnelles'),
           TextField(
             controller: _energyKcalCtrl,
@@ -417,7 +414,6 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
             keyboardType: TextInputType.number,
             decoration: const InputDecoration(labelText: 'Protéines (g)'),
           ),
-
           _sectionTitle('Électrolytes & minéraux'),
           TextField(
             controller: _chlorideMgCtrl,
@@ -454,7 +450,6 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
             keyboardType: TextInputType.number,
             decoration: const InputDecoration(labelText: 'Fer (mg)'),
           ),
-
           _sectionTitle('Vitamines'),
           TextField(
             controller: _vitCMgCtrl,
@@ -479,7 +474,6 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
             keyboardType: TextInputType.number,
             decoration: const InputDecoration(labelText: 'Vitamine B2 (mg)'),
           ),
-
           const SizedBox(height: 22),
           FilledButton(onPressed: _save, child: const Text('Enregistrer')),
           const SizedBox(height: 12),
@@ -558,9 +552,8 @@ class IntakeHistoryScreen extends StatelessWidget {
               final type = _typeLabel(m['type']);
 
               final basisRaw = (m['basis'] ?? 'portion').toString();
-              final basisLabel = (basisRaw == '100g')
-                  ? 'pour 100g'
-                  : 'par portion';
+              final basisLabel =
+                  (basisRaw == '100g') ? 'pour 100g' : 'par portion';
 
               final weightG = _asDouble(m['weight_g']);
               final servingG = _asDouble(m['serving_size_g']);
@@ -681,6 +674,10 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
   }
 
   DateTime? _startAt;
+  // --- GPX (échantillonnage 10 min) ---
+  String? _gpxName;
+  List<GpxPoint> _gpxSamples10m = const [];
+  String _gpxMsg = '';
 
   // --- Weather (manual for now) ---
   final _tempCtrl = TextEditingController();
@@ -784,6 +781,41 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
     });
   }
 
+  Future<void> _pickGpxAndSample10m() async {
+    setState(() => _gpxMsg = '');
+
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['gpx'],
+      withData: true, // important: on récupère les bytes
+    );
+
+    if (res == null || res.files.isEmpty) return;
+
+    final file = res.files.single;
+    final bytes = file.bytes;
+    if (bytes == null) {
+      setState(
+          () => _gpxMsg = 'Impossible de lire le fichier GPX (bytes null).');
+      return;
+    }
+
+    final xml = utf8.decode(bytes, allowMalformed: true);
+
+    try {
+      final pts = parseGpxPoints(xml);
+      final sampled = sampleEveryMinutes(pts, everyMinutes: 10);
+
+      setState(() {
+        _gpxName = file.name;
+        _gpxSamples10m = sampled;
+        _gpxMsg = '✅ GPX importé : ${sampled.length} point(s) (10 min)';
+      });
+    } catch (e) {
+      setState(() => _gpxMsg = 'Erreur GPX : $e');
+    }
+  }
+
   Future<void> _save() async {
     final duration = _toInt(_durationCtrl.text);
     if (duration == null || duration <= 0) {
@@ -802,24 +834,22 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
       'source': 'manual',
       'ts_start': now,
       'ts_end': tsEnd,
-
       'temp_c': _toDoubleOrNull(_tempCtrl.text),
       'feels_like_c': _toDoubleOrNull(_feelsLikeCtrl.text),
       'temp_min_c': _toDoubleOrNull(_tempMinCtrl.text),
       'temp_max_c': _toDoubleOrNull(_tempMaxCtrl.text),
-
       'heat_index_c': _toDoubleOrNull(_heatIndexCtrl.text),
       'wind_chill_c': _toDoubleOrNull(_windChillCtrl.text),
-
       'humidity_pct': _toDoubleOrNull(_humidityCtrl.text),
       'wind_kmh': _toDoubleOrNull(_windCtrl.text),
       'precip_mm': _toDoubleOrNull(_precipCtrl.text),
-
       'confidence': _toDoubleOrNull(_confidenceCtrl.text) ?? 1.0,
     };
 
-    final activity = {
-      'ts': now,
+    // 1) Construire l'activité "de base" (sans météo auto)
+    final activity = <String, dynamic>{
+      'ts': DateTime.now().millisecondsSinceEpoch,
+      'start_at': _startAt?.toUtc().millisecondsSinceEpoch, // optionnel
       'type': _type,
       'duration_min': duration,
       'distance_km': _toDouble(_distanceCtrl.text),
@@ -827,25 +857,89 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
       'rpe': _rpe,
       'notes': _notesCtrl.text.trim().isEmpty ? null : _notesCtrl.text.trim(),
 
-      // 👇 météo intégrée au résumé
-      'weather': {
+      // 2) météo manuelle
+      'weather_manual': {
         'temp_c': _toDouble(_tempCtrl.text),
         'feels_like_c': _toDouble(_feelsLikeCtrl.text),
         'humidity_pct': _toInt(_humidityCtrl.text),
         'wind_kph': _toDouble(_windCtrl.text),
         'precip_mm': _toDouble(_precipCtrl.text),
-
-        // conserver aussi :
         'heat_index_c': _toDouble(_heatIndexCtrl.text),
         'wind_chill_c': _toDouble(_windChillCtrl.text),
-
-        // données détaillées : météo automatique (à remplir plus tard)
-        'weather_samples': <Map<String, dynamic>>[],
+        'confidence': _toDouble(_confidenceCtrl.text),
       },
     };
-    debugPrint('ACTIVITY TO SAVE: $activity');
-    await _box.add(activity);
 
+    // 3) Stocker la trace GPX échantillonnée (si dispo)
+    activity['gpx_samples_10m'] = _gpxSamples10m
+        .map((p) => {'ts': p.ts, 'lat': p.lat, 'lon': p.lon})
+        .toList();
+
+    // 4) Météo automatique (Open-Meteo) à partir des points GPX
+    final client = OpenMeteoArchiveClient();
+    final samples = <Map<String, dynamic>>[];
+
+    for (final p in _gpxSamples10m) {
+      final w = await client.fetchForPoint(
+        ts: DateTime.fromMillisecondsSinceEpoch(p.ts, isUtc: true),
+        lat: p.lat,
+        lon: p.lon,
+      );
+      if (w != null) samples.add(w.toMap());
+    }
+
+    // 5) Stockage détaillé
+    activity['weather_samples_10m'] = samples;
+
+    // 6) Résumé simple pour l’historique (moyennes)
+    double avg(List<double> xs) =>
+        xs.isEmpty ? 0 : xs.reduce((a, b) => a + b) / xs.length;
+
+    final temps = samples
+        .whereType<Map>()
+        .map((m) => m['temp_c'])
+        .whereType<num>()
+        .map((v) => v.toDouble())
+        .toList();
+    final feels = samples
+        .whereType<Map>()
+        .map((m) => m['feels_like_c'])
+        .whereType<num>()
+        .map((v) => v.toDouble())
+        .toList();
+    final hums = samples
+        .whereType<Map>()
+        .map((m) => m['humidity_pct'])
+        .whereType<num>()
+        .map((v) => v.toDouble())
+        .toList();
+    final winds = samples
+        .whereType<Map>()
+        .map((m) => m['wind_kph'])
+        .whereType<num>()
+        .map((v) => v.toDouble())
+        .toList();
+    final precs = samples
+        .whereType<Map>()
+        .map((m) => m['precip_mm'])
+        .whereType<num>()
+        .map((v) => v.toDouble())
+        .toList();
+
+    activity['weather'] = {
+      'temp_c': temps.isEmpty ? null : avg(temps),
+      'feels_like_c': feels.isEmpty ? null : avg(feels),
+      'humidity_pct': hums.isEmpty ? null : avg(hums).round(),
+      'wind_kph': winds.isEmpty ? null : avg(winds),
+      'precip_mm': precs.isEmpty ? null : avg(precs),
+      'provider': 'open-meteo',
+      'heat_index_c': null,
+      'wind_chill_c': null,
+    };
+
+    debugPrint('ACTIVITY TO SAVE: $activity');
+
+    await _box.add(activity);
     setState(() => _message = '✅ Activité enregistrée');
 
     _durationCtrl.clear(); // durée effort
@@ -909,7 +1003,6 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
               ),
             ],
           ),
-
           const SizedBox(height: 12),
           TextField(
             controller: _durationCtrl,
@@ -953,7 +1046,6 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
             style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: 10),
-
           TextField(
             controller: _tempCtrl,
             keyboardType: TextInputType.number,
@@ -983,7 +1075,6 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
             keyboardType: TextInputType.number,
             decoration: const InputDecoration(labelText: 'Précipitations (mm)'),
           ),
-
           const SizedBox(height: 12),
           TextField(
             controller: _heatIndexCtrl,
@@ -1006,7 +1097,62 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
             keyboardType: TextInputType.number,
             decoration: const InputDecoration(labelText: 'Confiance (0–1)'),
           ),
+          const SizedBox(height: 12),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            title: Text(
+                _gpxName == null ? 'GPX : aucun fichier' : 'GPX : $_gpxName'),
+            subtitle: Text(
+              _gpxSamples10m.isEmpty
+                  ? 'Points 10 min : 0'
+                  : 'Points 10 min : ${_gpxSamples10m.length}',
+            ),
+            trailing: OutlinedButton.icon(
+              onPressed: () async {
+                debugPrint('GPX: click');
 
+                try {
+                  final result = await FilePicker.platform.pickFiles(
+                    type: FileType.custom,
+                    allowedExtensions: const ['gpx', 'xml'],
+                    withData: true, // important sur Android
+                  );
+
+                  if (result == null) {
+                    debugPrint('GPX: cancelled (result == null)');
+                    return;
+                  }
+
+                  final file = result.files.single;
+
+                  debugPrint(
+                      'GPX: picked name=${file.name} path=${file.path} bytes=${file.bytes?.length}');
+
+                  final bytes = file.bytes;
+                  if (bytes == null) {
+                    debugPrint(
+                        'GPX: bytes == null (impossible de lire le fichier)');
+                    return;
+                  }
+
+                  final xml = utf8.decode(bytes);
+                  debugPrint('GPX: xml length=${xml.length}');
+
+                  // ensuite ton parse + sampling
+                } catch (e, st) {
+                  debugPrint('GPX: ERROR $e');
+                  debugPrint('$st');
+                }
+              },
+              icon: const Icon(Icons.upload_file),
+              label: const Text('Importer GPX'),
+            ),
+          ),
+          if (_gpxMsg.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(_gpxMsg),
+          ],
+          const SizedBox(height: 12),
           const SizedBox(height: 20),
           FilledButton(
             onPressed: _save,
@@ -1026,7 +1172,8 @@ class ActivityHistoryScreen extends StatelessWidget {
 
   Box get _box => Hive.box('activities');
 
-  String _formatTs(int ts) {
+  String _formatTs(dynamic ts) {
+    if (ts is! int) return '';
     final dt = DateTime.fromMillisecondsSinceEpoch(ts);
     String two(int n) => n.toString().padLeft(2, '0');
     return '${two(dt.day)}/${two(dt.month)} ${two(dt.hour)}:${two(dt.minute)}';
