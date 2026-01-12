@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'weather_gpx_tools.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -146,7 +147,7 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
           () => _message =
               'Hydratation : indique le nombre de pastilles ou le grammage de poudre (sinon 0).',
         );
-        // On ne bloque pas : défaut = 0. Donc on continue.
+        // No stop, default = 0. So continue.
       }
     }
 
@@ -317,7 +318,7 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
           const SizedBox(height: 12),
 
           DropdownButtonFormField<String>(
-            value: _type,
+            initialValue: _type,
             items: _typeLabels.entries
                 .map(
                   (e) => DropdownMenuItem(value: e.key, child: Text(e.value)),
@@ -329,7 +330,7 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
           const SizedBox(height: 12),
 
           DropdownButtonFormField<String>(
-            value: _basis,
+            initialValue: _basis,
             items: _basisLabels.entries
                 .map(
                   (e) => DropdownMenuItem(value: e.key, child: Text(e.value)),
@@ -341,7 +342,7 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
           const SizedBox(height: 12),
 
           DropdownButtonFormField<String>(
-            value: _intakeContext,
+            initialValue: _intakeContext,
             items: _contextLabels.entries
                 .map(
                   (e) => DropdownMenuItem(value: e.key, child: Text(e.value)),
@@ -673,6 +674,26 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
   String _type = 'sortie_longue';
   int _rpe = 5;
   String _message = '';
+  String _fmtStartAt(DateTime? dt) {
+    if (dt == null) return 'Non défini';
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(dt.day)}/${two(dt.month)}/${dt.year} ${two(dt.hour)}:${two(dt.minute)}';
+  }
+
+  DateTime? _startAt;
+
+  // --- Weather (manual for now) ---
+  final _tempCtrl = TextEditingController();
+  final _feelsLikeCtrl = TextEditingController();
+  final _humidityCtrl = TextEditingController();
+  final _windCtrl = TextEditingController();
+  final _precipCtrl = TextEditingController();
+
+  final _tempMinCtrl = TextEditingController();
+  final _tempMaxCtrl = TextEditingController();
+  final _heatIndexCtrl = TextEditingController();
+  final _windChillCtrl = TextEditingController();
+  final _confidenceCtrl = TextEditingController(text: '1.0');
 
   final _durationCtrl = TextEditingController();
   final _distanceCtrl = TextEditingController();
@@ -692,11 +713,76 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
     _distanceCtrl.dispose();
     _dplusCtrl.dispose();
     _notesCtrl.dispose();
+
+    _tempCtrl.dispose();
+    _feelsLikeCtrl.dispose();
+    _humidityCtrl.dispose();
+    _windCtrl.dispose();
+    _precipCtrl.dispose();
+    _tempMinCtrl.dispose();
+    _tempMaxCtrl.dispose();
+    _heatIndexCtrl.dispose();
+    _windChillCtrl.dispose();
+    _confidenceCtrl.dispose();
+
     super.dispose();
   }
 
   int? _toInt(String s) => int.tryParse(s.trim());
   double? _toDouble(String s) => double.tryParse(s.trim().replaceAll(',', '.'));
+  double? _toDoubleOrNull(String s) {
+    final t = s.trim().replaceAll(',', '.');
+    if (t.isEmpty) return null;
+    return double.tryParse(t);
+  }
+
+  Future<void> _pickDate() async {
+    final now = DateTime.now();
+    final initial = _startAt ?? now;
+
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(now.year - 3),
+      lastDate: DateTime(now.year + 1),
+    );
+
+    if (picked == null) return;
+
+    setState(() {
+      final current = _startAt ?? now;
+      _startAt = DateTime(
+        picked.year,
+        picked.month,
+        picked.day,
+        current.hour,
+        current.minute,
+      );
+    });
+  }
+
+  Future<void> _pickTime() async {
+    final now = DateTime.now();
+    final initial = _startAt ?? now;
+
+    final picked = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay(hour: initial.hour, minute: initial.minute),
+    );
+
+    if (picked == null) return;
+
+    setState(() {
+      final current = _startAt ?? now;
+      _startAt = DateTime(
+        current.year,
+        current.month,
+        current.day,
+        picked.hour,
+        picked.minute,
+      );
+    });
+  }
 
   Future<void> _save() async {
     final duration = _toInt(_durationCtrl.text);
@@ -704,25 +790,69 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
       setState(() => _message = 'Durée invalide');
       return;
     }
+    if (_startAt == null) {
+      setState(() => _message = 'Date/heure de départ manquante');
+      return;
+    }
+
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final tsEnd = now + (duration * 60 * 1000);
+
+    final weather = {
+      'source': 'manual',
+      'ts_start': now,
+      'ts_end': tsEnd,
+
+      'temp_c': _toDoubleOrNull(_tempCtrl.text),
+      'feels_like_c': _toDoubleOrNull(_feelsLikeCtrl.text),
+      'temp_min_c': _toDoubleOrNull(_tempMinCtrl.text),
+      'temp_max_c': _toDoubleOrNull(_tempMaxCtrl.text),
+
+      'heat_index_c': _toDoubleOrNull(_heatIndexCtrl.text),
+      'wind_chill_c': _toDoubleOrNull(_windChillCtrl.text),
+
+      'humidity_pct': _toDoubleOrNull(_humidityCtrl.text),
+      'wind_kmh': _toDoubleOrNull(_windCtrl.text),
+      'precip_mm': _toDoubleOrNull(_precipCtrl.text),
+
+      'confidence': _toDoubleOrNull(_confidenceCtrl.text) ?? 1.0,
+    };
 
     final activity = {
-      'ts': DateTime.now().millisecondsSinceEpoch,
+      'ts': now,
       'type': _type,
       'duration_min': duration,
       'distance_km': _toDouble(_distanceCtrl.text),
       'dplus_m': _toInt(_dplusCtrl.text),
       'rpe': _rpe,
       'notes': _notesCtrl.text.trim().isEmpty ? null : _notesCtrl.text.trim(),
-    };
 
+      // 👇 météo intégrée au résumé
+      'weather': {
+        'temp_c': _toDouble(_tempCtrl.text),
+        'feels_like_c': _toDouble(_feelsLikeCtrl.text),
+        'humidity_pct': _toInt(_humidityCtrl.text),
+        'wind_kph': _toDouble(_windCtrl.text),
+        'precip_mm': _toDouble(_precipCtrl.text),
+
+        // conserver aussi :
+        'heat_index_c': _toDouble(_heatIndexCtrl.text),
+        'wind_chill_c': _toDouble(_windChillCtrl.text),
+
+        // données détaillées : météo automatique (à remplir plus tard)
+        'weather_samples': <Map<String, dynamic>>[],
+      },
+    };
+    debugPrint('ACTIVITY TO SAVE: $activity');
     await _box.add(activity);
 
     setState(() => _message = '✅ Activité enregistrée');
 
-    _durationCtrl.clear();
-    _distanceCtrl.clear();
-    _dplusCtrl.clear();
-    _notesCtrl.clear();
+    _durationCtrl.clear(); // durée effort
+    _distanceCtrl.clear(); // distance effort
+    _dplusCtrl.clear(); // dénivelé effort
+    _notesCtrl.clear(); // notes effort
+    setState(() => _startAt = null);
   }
 
   @override
@@ -748,7 +878,7 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
         padding: const EdgeInsets.all(16),
         children: [
           DropdownButtonFormField<String>(
-            value: _type,
+            initialValue: _type,
             items: _types.entries
                 .map(
                   (e) => DropdownMenuItem(value: e.key, child: Text(e.value)),
@@ -757,6 +887,29 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
             onChanged: (v) => setState(() => _type = v ?? 'sortie_longue'),
             decoration: const InputDecoration(labelText: 'Type d’effort'),
           ),
+          const SizedBox(height: 12),
+          Text('Départ : ${_fmtStartAt(_startAt)}'),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _pickDate,
+                  icon: const Icon(Icons.calendar_today),
+                  label: const Text('Date'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _pickTime,
+                  icon: const Icon(Icons.schedule),
+                  label: const Text('Heure'),
+                ),
+              ),
+            ],
+          ),
+
           const SizedBox(height: 12),
           TextField(
             controller: _durationCtrl,
@@ -794,6 +947,66 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
               hintText: 'Chaleur, fatigue, digestion…',
             ),
           ),
+          const SizedBox(height: 16),
+          const Text(
+            'Météo (manuel pour l’instant)',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 10),
+
+          TextField(
+            controller: _tempCtrl,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Température (°C)'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _feelsLikeCtrl,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Ressenti (°C)'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _humidityCtrl,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Humidité (%)'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _windCtrl,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Vent (km/h)'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _precipCtrl,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Précipitations (mm)'),
+          ),
+
+          const SizedBox(height: 12),
+          TextField(
+            controller: _heatIndexCtrl,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: 'Heat index (°C) (optionnel)',
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _windChillCtrl,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: 'Wind chill (°C) (optionnel)',
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _confidenceCtrl,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Confiance (0–1)'),
+          ),
+
           const SizedBox(height: 20),
           FilledButton(
             onPressed: _save,
@@ -834,6 +1047,7 @@ class ActivityHistoryScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    print('>>> ActivityHistoryScreen BUILD <<<');
     return Scaffold(
       appBar: AppBar(title: const Text('Historique des activités')),
       body: ValueListenableBuilder(
@@ -850,19 +1064,59 @@ class ActivityHistoryScreen extends StatelessWidget {
             itemCount: keys.length,
             separatorBuilder: (_, __) => const SizedBox(height: 8),
             itemBuilder: (context, i) {
-              final m = box.get(keys[i]) as Map;
+              final key = keys[i];
+              final m = box.get(key);
+              print('>>> ITEM BUILDER HIT <<<');
+              print('ACTIVITY RAW: $m');
+
+              if (m is! Map) {
+                return ListTile(title: Text('Entrée invalide (clé: $key)'));
+              }
 
               final title =
-                  '${_label(m['type'])} • ${m['duration_min']} min • RPE ${m['rpe']}';
+                  '${_formatTs(m['ts'])} • ${_label(m['type'])} • ${m['duration_min'] ?? "?"} min';
 
-              final subtitle = [
+              final parts = <String>[
                 if (m['distance_km'] != null) '${m['distance_km']} km',
                 if (m['dplus_m'] != null) 'D+ ${m['dplus_m']} m',
+                if (m['rpe'] != null) 'RPE ${m['rpe']}',
                 if (m['notes'] != null) '📝 ${m['notes']}',
-              ].join(' • ');
+              ];
+
+              // --- météo ---
+              final weather = m['weather'];
+              if (weather is Map) {
+                final weatherParts = <String>[
+                  if (weather['temp_c'] != null) 'T° ${weather['temp_c']}°C',
+                  if (weather['feels_like_c'] != null)
+                    'ress. ${weather['feels_like_c']}°C',
+                  if (weather['humidity_pct'] != null)
+                    'hum ${weather['humidity_pct']}%',
+                  if (weather['wind_kph'] != null)
+                    'vent ${weather['wind_kph']} km/h',
+                  if (weather['precip_mm'] != null)
+                    'pluie ${weather['precip_mm']} mm',
+                  if (weather['heat_index_c'] != null &&
+                      weather['heat_index_c'] != 0)
+                    'heat ${weather['heat_index_c']}°C',
+                  if (weather['wind_chill_c'] != null &&
+                      weather['wind_chill_c'] != 0)
+                    'chill ${weather['wind_chill_c']}°C',
+                ];
+
+                parts.add(
+                  weatherParts.isEmpty
+                      ? '🌦️ météo: —'
+                      : '🌦️ ${weatherParts.join(' • ')}',
+                );
+              } else {
+                parts.add('🌦️ météo: absente');
+              }
+
+              final subtitle = parts.join(' • ');
 
               return Dismissible(
-                key: ValueKey(keys[i]),
+                key: ValueKey(key),
                 direction: DismissDirection.endToStart,
                 background: Container(
                   alignment: Alignment.centerRight,
@@ -870,7 +1124,7 @@ class ActivityHistoryScreen extends StatelessWidget {
                   color: Colors.red.withOpacity(0.15),
                   child: const Icon(Icons.delete),
                 ),
-                onDismissed: (_) => box.delete(keys[i]),
+                onDismissed: (_) => box.delete(key),
                 child: ListTile(
                   tileColor: Theme.of(
                     context,
@@ -878,11 +1132,9 @@ class ActivityHistoryScreen extends StatelessWidget {
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
-                  title: Text(_formatTs(m['ts'])),
-                  subtitle: Text(
-                    subtitle.isEmpty ? title : '$title\n$subtitle',
-                  ),
-                  isThreeLine: subtitle.isNotEmpty,
+                  title: Text(title),
+                  subtitle: subtitle.isEmpty ? null : Text(subtitle),
+                  isThreeLine: true,
                 ),
               );
             },
