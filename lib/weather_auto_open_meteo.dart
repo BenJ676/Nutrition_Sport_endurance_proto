@@ -97,7 +97,7 @@ class OpenMeteoArchiveClient {
       if (dt == null) continue;
 
       final diff = (dt.difference(target)).abs();
-      if (bestDiff == null || diff < bestDiff!) {
+      if (bestDiff == null || diff < bestDiff) {
         bestDiff = diff;
         bestIdx = i;
       }

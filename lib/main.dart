@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'dart:convert';
 import 'package:file_picker/file_picker.dart';
@@ -679,18 +680,10 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
   List<GpxPoint> _gpxSamples10m = const [];
   String _gpxMsg = '';
 
-  // --- Weather (manual for now) ---
-  final _tempCtrl = TextEditingController();
-  final _feelsLikeCtrl = TextEditingController();
-  final _humidityCtrl = TextEditingController();
-  final _windCtrl = TextEditingController();
-  final _precipCtrl = TextEditingController();
-
-  final _tempMinCtrl = TextEditingController();
-  final _tempMaxCtrl = TextEditingController();
-  final _heatIndexCtrl = TextEditingController();
-  final _windChillCtrl = TextEditingController();
-  final _confidenceCtrl = TextEditingController(text: '1.0');
+  // --- Barre de Progression météo ---
+  bool _weatherRunning = false;
+  int _weatherDone = 0;
+  int _weatherTotal = 0;
 
   final _durationCtrl = TextEditingController();
   final _distanceCtrl = TextEditingController();
@@ -710,17 +703,6 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
     _distanceCtrl.dispose();
     _dplusCtrl.dispose();
     _notesCtrl.dispose();
-
-    _tempCtrl.dispose();
-    _feelsLikeCtrl.dispose();
-    _humidityCtrl.dispose();
-    _windCtrl.dispose();
-    _precipCtrl.dispose();
-    _tempMinCtrl.dispose();
-    _tempMaxCtrl.dispose();
-    _heatIndexCtrl.dispose();
-    _windChillCtrl.dispose();
-    _confidenceCtrl.dispose();
 
     super.dispose();
   }
@@ -781,18 +763,40 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
     });
   }
 
-  Future<void> _pickGpxAndSample10m() async {
+  Future<void> _importGpx() async {
     setState(() => _gpxMsg = '');
 
-    final res = await FilePicker.platform.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['gpx'],
-      withData: true, // important: on récupère les bytes
-    );
+    FilePickerResult? res;
+    try {
+      res = await FilePicker.platform.pickFiles(
+        type: FileType.any, // contourne le filtre Android
+        withData: true,
+      );
+    } on PlatformException catch (e, st) {
+      debugPrint('GPX: PlatformException ${e.code} ${e.message}');
+      debugPrint('$st');
+      setState(() => _gpxMsg = 'Erreur FilePicker (${e.code}) : ${e.message}');
+      return;
+    } catch (e, st) {
+      debugPrint('GPX: FilePicker ERROR $e');
+      debugPrint('$st');
+      setState(() => _gpxMsg = 'Erreur FilePicker: $e');
+      return;
+    }
 
-    if (res == null || res.files.isEmpty) return;
+    if (res == null || res.files.isEmpty) {
+      setState(() => _gpxMsg = 'Import annulé.');
+      return;
+    }
 
-    final file = res.files.single;
+    final file = res.files.first;
+    final name = file.name.toLowerCase(); // contrôle de l'extension
+    if (!name.endsWith('.gpx')) {
+      setState(
+          () => _gpxMsg = 'Fichier non supporté: ${file.name} (attendu: .gpx)');
+      return;
+    }
+
     final bytes = file.bytes;
     if (bytes == null) {
       setState(
@@ -811,7 +815,9 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
         _gpxSamples10m = sampled;
         _gpxMsg = '✅ GPX importé : ${sampled.length} point(s) (10 min)';
       });
-    } catch (e) {
+    } catch (e, st) {
+      debugPrint('GPX: PARSE ERROR $e');
+      debugPrint('$st');
       setState(() => _gpxMsg = 'Erreur GPX : $e');
     }
   }
@@ -822,132 +828,134 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
       setState(() => _message = 'Durée invalide');
       return;
     }
-    if (_startAt == null) {
-      setState(() => _message = 'Date/heure de départ manquante');
-      return;
-    }
 
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final tsEnd = now + (duration * 60 * 1000);
-
-    final weather = {
-      'source': 'manual',
-      'ts_start': now,
-      'ts_end': tsEnd,
-      'temp_c': _toDoubleOrNull(_tempCtrl.text),
-      'feels_like_c': _toDoubleOrNull(_feelsLikeCtrl.text),
-      'temp_min_c': _toDoubleOrNull(_tempMinCtrl.text),
-      'temp_max_c': _toDoubleOrNull(_tempMaxCtrl.text),
-      'heat_index_c': _toDoubleOrNull(_heatIndexCtrl.text),
-      'wind_chill_c': _toDoubleOrNull(_windChillCtrl.text),
-      'humidity_pct': _toDoubleOrNull(_humidityCtrl.text),
-      'wind_kmh': _toDoubleOrNull(_windCtrl.text),
-      'precip_mm': _toDoubleOrNull(_precipCtrl.text),
-      'confidence': _toDoubleOrNull(_confidenceCtrl.text) ?? 1.0,
-    };
-
-    // 1) Construire l'activité "de base" (sans météo auto)
+    // 1) Activité de base
     final activity = <String, dynamic>{
       'ts': DateTime.now().millisecondsSinceEpoch,
-      'start_at': _startAt?.toUtc().millisecondsSinceEpoch, // optionnel
       'type': _type,
       'duration_min': duration,
       'distance_km': _toDouble(_distanceCtrl.text),
       'dplus_m': _toInt(_dplusCtrl.text),
       'rpe': _rpe,
       'notes': _notesCtrl.text.trim().isEmpty ? null : _notesCtrl.text.trim(),
+      'start_at_ms': _startAt?.millisecondsSinceEpoch,
 
-      // 2) météo manuelle
-      'weather_manual': {
-        'temp_c': _toDouble(_tempCtrl.text),
-        'feels_like_c': _toDouble(_feelsLikeCtrl.text),
-        'humidity_pct': _toInt(_humidityCtrl.text),
-        'wind_kph': _toDouble(_windCtrl.text),
-        'precip_mm': _toDouble(_precipCtrl.text),
-        'heat_index_c': _toDouble(_heatIndexCtrl.text),
-        'wind_chill_c': _toDouble(_windChillCtrl.text),
-        'confidence': _toDouble(_confidenceCtrl.text),
-      },
+      // GPX (si présent)
+      'gpx_name': _gpxName,
+      'gpx_samples_10m': _gpxSamples10m
+          .map((p) => {'ts': p.ts, 'lat': p.lat, 'lon': p.lon})
+          .toList(),
+
+      // météo : placeholders (remplis plus bas si GPX présent)
+      'weather': null,
+      'weather_samples_10m': <Map<String, dynamic>>[],
+      'weather_status': 'pending', // pending | ok | error
+      'weather_error': null,
     };
 
-    // 3) Stocker la trace GPX échantillonnée (si dispo)
-    activity['gpx_samples_10m'] = _gpxSamples10m
-        .map((p) => {'ts': p.ts, 'lat': p.lat, 'lon': p.lon})
-        .toList();
+    // Enregistre tout de suite (sans bloquer l'UI)
+    final activityKey = await _box.add(activity);
+    setState(
+        () => _message = '✅ Activité enregistrée • 🌦️ Calcul météo en cours…');
 
-    // 4) Météo automatique (Open-Meteo) à partir des points GPX
-    final client = OpenMeteoArchiveClient();
-    final samples = <Map<String, dynamic>>[];
+    // calcule la météo en "tâche de fond" et met à jour l'entrée existante
+    if (_gpxSamples10m.isNotEmpty) {
+      // init progression
+      setState(() {
+        _weatherRunning = true;
+        _weatherDone = 0;
+        _weatherTotal = _gpxSamples10m.length;
+      });
 
-    for (final p in _gpxSamples10m) {
-      final w = await client.fetchForPoint(
-        ts: DateTime.fromMillisecondsSinceEpoch(p.ts, isUtc: true),
-        lat: p.lat,
-        lon: p.lon,
-      );
-      if (w != null) samples.add(w.toMap());
+      Future(() async {
+        try {
+          final client = OpenMeteoArchiveClient();
+          final weatherSamples = <Map<String, dynamic>>[];
+
+          for (final p in _gpxSamples10m) {
+            final w = await client.fetchForPoint(
+              ts: DateTime.fromMillisecondsSinceEpoch(p.ts, isUtc: true),
+              lat: p.lat,
+              lon: p.lon,
+            );
+            if (w != null) weatherSamples.add(w.toMap());
+
+            // progression (1 point traité)
+            if (mounted) {
+              setState(() => _weatherDone += 1);
+            }
+          }
+
+          double? avgD(List<double> xs) =>
+              xs.isEmpty ? null : xs.reduce((a, b) => a + b) / xs.length;
+
+          int? avgI(List<int> xs) => xs.isEmpty
+              ? null
+              : (xs.reduce((a, b) => a + b) / xs.length).round();
+
+          List<double> takeD(String k) => weatherSamples
+              .map((m) => m[k])
+              .whereType<num>()
+              .map((v) => v.toDouble())
+              .toList();
+
+          List<int> takeI(String k) => weatherSamples
+              .map((m) => m[k])
+              .whereType<num>()
+              .map((v) => v.toInt())
+              .toList();
+
+          final temps = takeD('temp_c');
+          final feels = takeD('feels_like_c');
+          final winds = takeD('wind_kph');
+          final precs = takeD('precip_mm');
+          final hums = takeI('humidity_pct');
+
+          // repartir de ce qui est réellement stocké, puis mettre à jour
+          final stored = _box.get(activityKey);
+          if (stored is! Map) return;
+
+          final updated = Map<String, dynamic>.from(stored);
+          updated['weather_samples_10m'] = weatherSamples;
+          updated['weather_status'] = 'ok';
+          updated['weather_error'] = null;
+          updated['weather'] = <String, dynamic>{
+            'temp_c': avgD(temps),
+            'feels_like_c': avgD(feels),
+            'humidity_pct': avgI(hums),
+            'wind_kph': avgD(winds),
+            'precip_mm': avgD(precs),
+            'heat_index_c': null,
+            'wind_chill_c': null,
+            'provider': 'open-meteo',
+          };
+
+          await _box.put(activityKey, updated);
+
+          if (!mounted) return;
+          setState(() {
+            _weatherRunning = false;
+            _message = '✅ Activité enregistrée + météo OK';
+          });
+        } catch (e, st) {
+          final stored = _box.get(activityKey);
+          if (stored is Map) {
+            final updated = Map<String, dynamic>.from(stored);
+            updated['weather_status'] = 'error';
+            updated['weather_error'] = e.toString();
+            await _box.put(activityKey, updated);
+          }
+          debugPrint('WEATHER: ERROR $e');
+          debugPrint('$st');
+          if (!mounted) return;
+          setState(() {
+            _weatherRunning = false;
+            _message = '⚠️ Activité OK, météo en erreur: $e';
+          });
+        }
+      });
     }
-
-    // 5) Stockage détaillé
-    activity['weather_samples_10m'] = samples;
-
-    // 6) Résumé simple pour l’historique (moyennes)
-    double avg(List<double> xs) =>
-        xs.isEmpty ? 0 : xs.reduce((a, b) => a + b) / xs.length;
-
-    final temps = samples
-        .whereType<Map>()
-        .map((m) => m['temp_c'])
-        .whereType<num>()
-        .map((v) => v.toDouble())
-        .toList();
-    final feels = samples
-        .whereType<Map>()
-        .map((m) => m['feels_like_c'])
-        .whereType<num>()
-        .map((v) => v.toDouble())
-        .toList();
-    final hums = samples
-        .whereType<Map>()
-        .map((m) => m['humidity_pct'])
-        .whereType<num>()
-        .map((v) => v.toDouble())
-        .toList();
-    final winds = samples
-        .whereType<Map>()
-        .map((m) => m['wind_kph'])
-        .whereType<num>()
-        .map((v) => v.toDouble())
-        .toList();
-    final precs = samples
-        .whereType<Map>()
-        .map((m) => m['precip_mm'])
-        .whereType<num>()
-        .map((v) => v.toDouble())
-        .toList();
-
-    activity['weather'] = {
-      'temp_c': temps.isEmpty ? null : avg(temps),
-      'feels_like_c': feels.isEmpty ? null : avg(feels),
-      'humidity_pct': hums.isEmpty ? null : avg(hums).round(),
-      'wind_kph': winds.isEmpty ? null : avg(winds),
-      'precip_mm': precs.isEmpty ? null : avg(precs),
-      'provider': 'open-meteo',
-      'heat_index_c': null,
-      'wind_chill_c': null,
-    };
-
-    debugPrint('ACTIVITY TO SAVE: $activity');
-
-    await _box.add(activity);
-    setState(() => _message = '✅ Activité enregistrée');
-
-    _durationCtrl.clear(); // durée effort
-    _distanceCtrl.clear(); // distance effort
-    _dplusCtrl.clear(); // dénivelé effort
-    _notesCtrl.clear(); // notes effort
-    setState(() => _startAt = null);
-  }
+  } // Fin save()
 
   @override
   Widget build(BuildContext context) {
@@ -1040,110 +1048,19 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
               hintText: 'Chaleur, fatigue, digestion…',
             ),
           ),
-          const SizedBox(height: 16),
-          const Text(
-            'Météo (manuel pour l’instant)',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-          ),
-          const SizedBox(height: 10),
-          TextField(
-            controller: _tempCtrl,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(labelText: 'Température (°C)'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _feelsLikeCtrl,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(labelText: 'Ressenti (°C)'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _humidityCtrl,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(labelText: 'Humidité (%)'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _windCtrl,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(labelText: 'Vent (km/h)'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _precipCtrl,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(labelText: 'Précipitations (mm)'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _heatIndexCtrl,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(
-              labelText: 'Heat index (°C) (optionnel)',
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _windChillCtrl,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(
-              labelText: 'Wind chill (°C) (optionnel)',
-            ),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _confidenceCtrl,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(labelText: 'Confiance (0–1)'),
-          ),
           const SizedBox(height: 12),
           ListTile(
             contentPadding: EdgeInsets.zero,
             title: Text(
-                _gpxName == null ? 'GPX : aucun fichier' : 'GPX : $_gpxName'),
+              _gpxName == null ? 'GPX : aucun fichier' : 'GPX : $_gpxName',
+            ),
             subtitle: Text(
               _gpxSamples10m.isEmpty
                   ? 'Points 10 min : 0'
                   : 'Points 10 min : ${_gpxSamples10m.length}',
             ),
             trailing: OutlinedButton.icon(
-              onPressed: () async {
-                debugPrint('GPX: click');
-
-                try {
-                  final result = await FilePicker.platform.pickFiles(
-                    type: FileType.custom,
-                    allowedExtensions: const ['gpx', 'xml'],
-                    withData: true, // important sur Android
-                  );
-
-                  if (result == null) {
-                    debugPrint('GPX: cancelled (result == null)');
-                    return;
-                  }
-
-                  final file = result.files.single;
-
-                  debugPrint(
-                      'GPX: picked name=${file.name} path=${file.path} bytes=${file.bytes?.length}');
-
-                  final bytes = file.bytes;
-                  if (bytes == null) {
-                    debugPrint(
-                        'GPX: bytes == null (impossible de lire le fichier)');
-                    return;
-                  }
-
-                  final xml = utf8.decode(bytes);
-                  debugPrint('GPX: xml length=${xml.length}');
-
-                  // ensuite ton parse + sampling
-                } catch (e, st) {
-                  debugPrint('GPX: ERROR $e');
-                  debugPrint('$st');
-                }
-              },
+              onPressed: _importGpx,
               icon: const Icon(Icons.upload_file),
               label: const Text('Importer GPX'),
             ),
@@ -1152,12 +1069,20 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
             const SizedBox(height: 8),
             Text(_gpxMsg),
           ],
-          const SizedBox(height: 12),
           const SizedBox(height: 20),
           FilledButton(
             onPressed: _save,
             child: const Text('Enregistrer l’activité'),
           ),
+          if (_weatherRunning) ...[
+            const SizedBox(height: 12),
+            LinearProgressIndicator(
+              value:
+                  (_weatherTotal <= 0) ? null : (_weatherDone / _weatherTotal),
+            ),
+            const SizedBox(height: 6),
+            Text('Météo : $_weatherDone / $_weatherTotal'),
+          ],
           const SizedBox(height: 12),
           if (_message.isNotEmpty) Text(_message),
         ],
@@ -1231,24 +1156,21 @@ class ActivityHistoryScreen extends StatelessWidget {
               ];
 
               // --- météo ---
+              String _f1(num v) => v.toStringAsFixed(1); //arrondi au dixième
+
               final weather = m['weather'];
               if (weather is Map) {
                 final weatherParts = <String>[
-                  if (weather['temp_c'] != null) 'T° ${weather['temp_c']}°C',
+                  if (weather['temp_c'] != null)
+                    'T° ${_f1(weather['temp_c'])}°C',
                   if (weather['feels_like_c'] != null)
-                    'ress. ${weather['feels_like_c']}°C',
+                    'ress. ${_f1(weather['feels_like_c'])}°C',
                   if (weather['humidity_pct'] != null)
                     'hum ${weather['humidity_pct']}%',
                   if (weather['wind_kph'] != null)
-                    'vent ${weather['wind_kph']} km/h',
+                    'vent ${_f1(weather['wind_kph'])} km/h',
                   if (weather['precip_mm'] != null)
-                    'pluie ${weather['precip_mm']} mm',
-                  if (weather['heat_index_c'] != null &&
-                      weather['heat_index_c'] != 0)
-                    'heat ${weather['heat_index_c']}°C',
-                  if (weather['wind_chill_c'] != null &&
-                      weather['wind_chill_c'] != 0)
-                    'chill ${weather['wind_chill_c']}°C',
+                    'pluie ${_f1(weather['precip_mm'])} mm',
                 ];
 
                 parts.add(
@@ -1273,15 +1195,23 @@ class ActivityHistoryScreen extends StatelessWidget {
                 ),
                 onDismissed: (_) => box.delete(key),
                 child: ListTile(
-                  tileColor: Theme.of(
-                    context,
-                  ).colorScheme.surfaceContainerHighest,
+                  tileColor:
+                      Theme.of(context).colorScheme.surfaceContainerHighest,
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
                   title: Text(title),
                   subtitle: subtitle.isEmpty ? null : Text(subtitle),
                   isThreeLine: true,
+                  onTap: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => ActivityDetailScreen(
+                          activity: Map<String, dynamic>.from(m as Map),
+                        ),
+                      ),
+                    );
+                  },
                 ),
               );
             },
@@ -1290,4 +1220,94 @@ class ActivityHistoryScreen extends StatelessWidget {
       ),
     );
   }
+}
+
+/// --- Screen: Activity detail ---
+class ActivityDetailScreen extends StatelessWidget {
+  const ActivityDetailScreen({super.key, required this.activity});
+
+  final Map<String, dynamic> activity;
+
+  String _fmtTs(int? ts) {
+    if (ts == null) return '';
+    final dt = DateTime.fromMillisecondsSinceEpoch(ts);
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(dt.day)}/${two(dt.month)}/${dt.year} ${two(dt.hour)}:${two(dt.minute)}';
+  }
+
+  double _asDouble(dynamic v) {
+    if (v is num) return v.toDouble();
+    return double.tryParse('$v') ?? 0.0;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final ts = activity['ts'] as int?;
+    final type = (activity['type'] ?? '').toString();
+    final dur = activity['duration_min'];
+    final dist = activity['distance_km'];
+    final dplus = activity['dplus_m'];
+    final rpe = activity['rpe'];
+
+    final weather = activity['weather'];
+    final samples = activity['weather_samples_10m'];
+    final gpx = activity['gpx_samples_10m'];
+
+    final temp = (weather is Map) ? weather['temp_c'] : null;
+    final feels = (weather is Map) ? weather['feels_like_c'] : null;
+    final hum = (weather is Map) ? weather['humidity_pct'] : null;
+    final wind = (weather is Map) ? weather['wind_kph'] : null;
+    final rain = (weather is Map) ? weather['precip_mm'] : null;
+
+    final weatherLine = (weather is Map)
+        ? [
+            if (temp != null) 'T° ${_asDouble(temp).toStringAsFixed(1)}°C',
+            if (feels != null) 'ress. ${_asDouble(feels).toStringAsFixed(1)}°C',
+            if (hum != null) 'hum $hum%',
+            if (wind != null) 'vent ${_asDouble(wind).toStringAsFixed(1)} km/h',
+            if (rain != null) 'pluie ${_asDouble(rain).toStringAsFixed(1)} mm',
+          ].join(' • ')
+        : '—';
+
+    final samplesCount = (samples is List) ? samples.length : 0;
+    final gpxCount = (gpx is List) ? gpx.length : 0;
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Détail activité')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          Text(
+            '${_fmtTs(ts)} • $type • ${dur ?? "?"} min',
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 12),
+          _kv('Distance', dist == null ? '—' : '$dist km'),
+          _kv('D+', dplus == null ? '—' : '$dplus m'),
+          _kv('RPE', rpe == null ? '—' : '$rpe / 10'),
+          const SizedBox(height: 16),
+          const Text(
+            'Météo moyenne (Open-Meteo)',
+            style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 8),
+          Text(weatherLine.isEmpty ? '—' : weatherLine),
+          const SizedBox(height: 12),
+          _kv('Échantillons météo (10 min)', '$samplesCount'),
+          _kv('Points GPX (10 min)', '$gpxCount'),
+        ],
+      ),
+    );
+  }
+
+  Widget _kv(String k, String v) => Padding(
+        padding: const EdgeInsets.only(bottom: 8),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            SizedBox(width: 170, child: Text(k)),
+            Expanded(child: Text(v)),
+          ],
+        ),
+      );
 }
