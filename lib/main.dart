@@ -4,13 +4,18 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'dart:convert';
 import 'package:file_picker/file_picker.dart';
 import 'weather_gpx_tools.dart';
-import 'weather_auto_open_meteo.dart';
+import 'weather_service.dart';
+import 'dart:convert';
+
+import 'package:image_picker/image_picker.dart';
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Hive.initFlutter();
   await Hive.openBox('intakes');
   await Hive.openBox('activities');
+  await Hive.openBox('weather_cache');
   runApp(const App());
 }
 
@@ -76,6 +81,14 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
   String _basis = 'portion'; // portion ou 100g
   String _message = '';
   String _intakeContext = 'unknown';
+  Map<String, dynamic>? _ocrDetected;
+
+  bool _ocrPending = false; // indique qu'on a une détection à valider
+
+  final _picker = ImagePicker();
+  String? _labelPhotoBase64; // photo emballage (base64)
+  String? _labelPhotoPath; // chemin local (temp) pour OCR
+  String _labelOcrText = ''; // texte brut OCR
 
   static const Map<String, String> _typeLabels = {
     'gel': 'Gel',
@@ -133,6 +146,72 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
 
   bool get _isHydration => _type == 'pastilles' || _type == 'poudre';
 
+  Future<void> _takeLabelPhoto() async {
+    try {
+      final x = await _picker.pickImage(
+        source: ImageSource.camera,
+        imageQuality: 85,
+      );
+      if (x == null) return;
+
+      final bytes = await x.readAsBytes();
+      final b64 = base64Encode(bytes);
+
+      setState(() {
+        _labelPhotoBase64 = b64;
+        _labelPhotoPath = x.path;
+        _labelOcrText = '⏳ OCR en cours…';
+        _message = '📷 Photo ajoutée';
+      });
+
+      // OCR local (ML Kit)
+      final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+      try {
+        final input = InputImage.fromFilePath(x.path);
+        final result = await recognizer.processImage(input);
+
+        if (!mounted) return;
+
+        final raw = result.text.trim();
+        final found = _extractNutritionFromOcr(raw);
+
+        setState(() {
+          _labelOcrText = raw.isEmpty ? '⚠️ Aucun texte détecté.' : raw;
+
+          // on garde les valeurs détectées pour validation
+          _ocrDetected = {
+            'brand': found['brand'],
+            'product': found['product'],
+            'serving_size_g': found['serving_size_g'],
+            'weight_g': found['weight_g'],
+            'kcal': found['kcal'],
+            'fat_g': found['fat_g'],
+            'carbs_g': found['carbs_g'],
+            'fiber_g': found['fiber_g'],
+            'protein_g': found['protein_g'],
+            'sodium_mg': found['sodium_mg'],
+            'chloride_mg': found['chloride_mg'],
+            'potassium_mg': found['potassium_mg'],
+            'calcium_mg': found['calcium_mg'],
+            'magnesium_mg': found['magnesium_mg'],
+            'iron_mg': found['iron_mg'],
+            'vit_c_mg': found['vit_c_mg'],
+            'vit_b12_mcg': found['vit_b12_mcg'],
+            'vit_b6_mg': found['vit_b6_mg'],
+            'vit_b2_mg': found['vit_b2_mg'],
+            'tablets_count': found['tablets_count'],
+            'powder_g': found['powder_g'],
+          };
+          _ocrPending = raw.isNotEmpty;
+        });
+      } finally {
+        await recognizer.close();
+      }
+    } catch (e) {
+      setState(() => _message = 'Erreur caméra/OCR: $e');
+    }
+  }
+
   Future<void> _save() async {
     final brand = _brandCtrl.text.trim();
     final product = _productCtrl.text.trim();
@@ -184,7 +263,10 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
     final intake = {
       // --- meta ---
       'ts': DateTime.now().millisecondsSinceEpoch,
-      'source': 'manual', // futur : 'photo_ai'
+      'source': 'manual',
+      'label_photo_b64': _labelPhotoBase64,
+      'label_text_ocr': _labelOcrText,
+
       // --- identity ---
       'brand': brand,
       'product': product,
@@ -247,6 +329,10 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
     setState(() => _message = '✅ Prise enregistrée');
 
     // clear only the most used fields (keep brand for rapid input)
+    _labelPhotoBase64 = null;
+    _labelPhotoPath = null;
+    _labelOcrText = '';
+
     _productCtrl.clear();
     _weightGCtrl.clear();
     _energyKcalCtrl.clear();
@@ -279,6 +365,42 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
         ),
       );
 
+  Map<String, double?> _extractNutritionFromOcr(String raw) {
+    // Normalisation simple
+    final t = raw
+        .replaceAll('\u00A0', ' ')
+        .replaceAll(',', '.') // virgule -> point
+        .toLowerCase();
+
+    double? pick(RegExp re) {
+      final m = re.firstMatch(t);
+      if (m == null) return null;
+      final s = m.group(1);
+      if (s == null) return null;
+      return double.tryParse(s);
+    }
+
+    // kcal / énergie
+    // Ex: "énergie 250 kcal", "250kcal"
+    final kcal = pick(RegExp(r'(\d+(?:\.\d+)?)\s*kcal'));
+
+    // glucides
+    // Ex: "glucides 30 g", "carbohydrates 30g"
+    final carbs = pick(RegExp(
+        r'(?:glucides|carbohydrates)\s*(?:[:\-]?\s*)?(\d+(?:\.\d+)?)\s*g'));
+
+    // sodium (mg)
+    // Ex: "sodium 300 mg"
+    final sodiumMg =
+        pick(RegExp(r'sodium\s*(?:[:\-]?\s*)?(\d+(?:\.\d+)?)\s*mg'));
+
+    return {
+      'kcal': kcal,
+      'carbs_g': carbs,
+      'sodium_mg': sodiumMg,
+    };
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -308,6 +430,32 @@ class _IntakeFormScreenState extends State<IntakeFormScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            onPressed: _takeLabelPhoto,
+            icon: const Icon(Icons.photo_camera),
+            label: Text(_labelPhotoBase64 == null
+                ? 'Prendre une photo (informations nutritionnelles)'
+                : 'Reprendre la photo'),
+          ),
+          if (_labelPhotoBase64 != null) ...[
+            const SizedBox(height: 8),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(12),
+              child: Image.memory(
+                base64Decode(_labelPhotoBase64!),
+                height: 180,
+                fit: BoxFit.cover,
+              ),
+            ),
+            if (_labelOcrText.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(
+                _labelOcrText,
+                style: const TextStyle(fontSize: 12),
+              ),
+            ],
+          ],
           TextField(
             controller: _brandCtrl,
             decoration: const InputDecoration(labelText: 'Marque (ex: Näak) *'),
@@ -663,6 +811,7 @@ class ActivityFormScreen extends StatefulWidget {
 
 class _ActivityFormScreenState extends State<ActivityFormScreen> {
   Box get _box => Hive.box('activities');
+  Box get _weatherCache => Hive.box('weather_cache');
 
   // --- State ---
   String _type = 'sortie_longue';
@@ -849,7 +998,7 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
       // météo : placeholders (remplis plus bas si GPX présent)
       'weather': null,
       'weather_samples_10m': <Map<String, dynamic>>[],
-      'weather_status': 'pending', // pending | ok | error
+      'weather_status': _gpxSamples10m.isNotEmpty ? 'pending' : 'none',
       'weather_error': null,
     };
 
@@ -860,77 +1009,31 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
 
     // calcule la météo en "tâche de fond" et met à jour l'entrée existante
     if (_gpxSamples10m.isNotEmpty) {
-      // init progression
-      setState(() {
-        _weatherRunning = true;
-        _weatherDone = 0;
-        _weatherTotal = _gpxSamples10m.length;
-      });
-
       Future(() async {
         try {
-          final client = OpenMeteoArchiveClient();
-          final weatherSamples = <Map<String, dynamic>>[];
+          final service = WeatherService();
 
-          for (final p in _gpxSamples10m) {
-            final w = await client.fetchForPoint(
-              ts: DateTime.fromMillisecondsSinceEpoch(p.ts, isUtc: true),
-              lat: p.lat,
-              lon: p.lon,
-            );
-            if (w != null) weatherSamples.add(w.toMap());
+          if (!mounted) return;
+          setState(() {
+            _weatherRunning = true;
+            _weatherDone = 0;
+            _weatherTotal = _gpxSamples10m.length; // total attendu
+          });
 
-            // progression (1 point traité)
-            if (mounted) {
-              setState(() => _weatherDone += 1);
-            }
-          }
+          await Future.delayed(const Duration(milliseconds: 500));
 
-          double? avgD(List<double> xs) =>
-              xs.isEmpty ? null : xs.reduce((a, b) => a + b) / xs.length;
-
-          int? avgI(List<int> xs) => xs.isEmpty
-              ? null
-              : (xs.reduce((a, b) => a + b) / xs.length).round();
-
-          List<double> takeD(String k) => weatherSamples
-              .map((m) => m[k])
-              .whereType<num>()
-              .map((v) => v.toDouble())
-              .toList();
-
-          List<int> takeI(String k) => weatherSamples
-              .map((m) => m[k])
-              .whereType<num>()
-              .map((v) => v.toInt())
-              .toList();
-
-          final temps = takeD('temp_c');
-          final feels = takeD('feels_like_c');
-          final winds = takeD('wind_kph');
-          final precs = takeD('precip_mm');
-          final hums = takeI('humidity_pct');
-
-          // repartir de ce qui est réellement stocké, puis mettre à jour
-          final stored = _box.get(activityKey);
-          if (stored is! Map) return;
-
-          final updated = Map<String, dynamic>.from(stored);
-          updated['weather_samples_10m'] = weatherSamples;
-          updated['weather_status'] = 'ok';
-          updated['weather_error'] = null;
-          updated['weather'] = <String, dynamic>{
-            'temp_c': avgD(temps),
-            'feels_like_c': avgD(feels),
-            'humidity_pct': avgI(hums),
-            'wind_kph': avgD(winds),
-            'precip_mm': avgD(precs),
-            'heat_index_c': null,
-            'wind_chill_c': null,
-            'provider': 'open-meteo',
-          };
-
-          await _box.put(activityKey, updated);
+          await service.computeAndAttachWeather(
+            activityKey: activityKey,
+            gpxSamples10m: _gpxSamples10m,
+            onProgress: (done, total) {
+              if (!mounted) return;
+              setState(() {
+                _weatherRunning = true;
+                _weatherDone = done;
+                _weatherTotal = total;
+              });
+            },
+          );
 
           if (!mounted) return;
           setState(() {
@@ -938,6 +1041,9 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
             _message = '✅ Activité enregistrée + météo OK';
           });
         } catch (e, st) {
+          debugPrint('WEATHER: ERROR $e');
+          debugPrint('$st');
+
           final stored = _box.get(activityKey);
           if (stored is Map) {
             final updated = Map<String, dynamic>.from(stored);
@@ -945,11 +1051,11 @@ class _ActivityFormScreenState extends State<ActivityFormScreen> {
             updated['weather_error'] = e.toString();
             await _box.put(activityKey, updated);
           }
-          debugPrint('WEATHER: ERROR $e');
-          debugPrint('$st');
-          if (!mounted) return;
+
           setState(() {
             _weatherRunning = false;
+            _weatherDone = 0;
+            _weatherTotal = 0;
             _message = '⚠️ Activité OK, météo en erreur: $e';
           });
         }
@@ -1172,14 +1278,18 @@ class ActivityHistoryScreen extends StatelessWidget {
                   if (weather['precip_mm'] != null)
                     'pluie ${_f1(weather['precip_mm'])} mm',
                 ];
-
-                parts.add(
-                  weatherParts.isEmpty
-                      ? '🌦️ météo: —'
-                      : '🌦️ ${weatherParts.join(' • ')}',
-                );
               } else {
-                parts.add('🌦️ météo: absente');
+                final status = m['weather_status'];
+                if (status == 'running') {
+                  parts.add('🌦️ météo: calcul…');
+                } else if (status == 'ok') {
+                  parts.add(
+                      '🌦️ météo: —'); // cas rare: ok mais pas de map météo
+                } else if (status == 'error') {
+                  parts.add('🌦️ météo: erreur');
+                } else {
+                  parts.add('🌦️ météo: absente');
+                }
               }
 
               final subtitle = parts.join(' • ');
@@ -1193,6 +1303,26 @@ class ActivityHistoryScreen extends StatelessWidget {
                   color: Colors.red.withOpacity(0.15),
                   child: const Icon(Icons.delete),
                 ),
+                confirmDismiss: (_) async {
+                  return await showDialog<bool>(
+                        context: context,
+                        builder: (ctx) => AlertDialog(
+                          title: const Text('Supprimer cette activité ?'),
+                          content: const Text('Cette action est définitive.'),
+                          actions: [
+                            TextButton(
+                              onPressed: () => Navigator.pop(ctx, false),
+                              child: const Text('Annuler'),
+                            ),
+                            FilledButton(
+                              onPressed: () => Navigator.pop(ctx, true),
+                              child: const Text('Supprimer'),
+                            ),
+                          ],
+                        ),
+                      ) ??
+                      false;
+                },
                 onDismissed: (_) => box.delete(key),
                 child: ListTile(
                   tileColor:
